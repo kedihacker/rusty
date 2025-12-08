@@ -1,58 +1,92 @@
-use wasmtime::*;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use tokio::sync::broadcast::{channel, Sender};
+use tokio::sync::Notify;
 
-struct MyState {
-    name: String,
-    count: usize,
+struct QueueProcessor<T> {
+    sender: Sender<T>,
+    start_signal: Arc<Notify>,
 }
 
-fn main() -> Result<()> {
-    // First the wasm module needs to be compiled. This is done with a global
-    // "compilation environment" within an `Engine`. Note that engines can be
-    // further configured through `Config` if desired instead of using the
-    // default like this is here.
-    println!("Compiling module...");
-    let engine = Engine::default();
-    let module = Module::from_file(&engine, "examples/hello.wat")?;
+impl<T: Clone + Send + 'static> QueueProcessor<T> {
+    fn new() -> Self {
+        let (sender, _) = channel(100);
+        Self {
+            sender,
+            start_signal: Arc::new(Notify::new()),
+        }
+    }
 
-    // After a module is compiled we create a `Store` which will contain
-    // instantiated modules and other items like host functions. A Store
-    // contains an arbitrary piece of host information, and we use `MyState`
-    // here.
-    println!("Initializing...");
-    let mut store = Store::new(
-        &engine,
-        MyState {
-            name: "hello, world!".to_string(),
-            count: 0,
-        },
-    );
+    fn sender(&self) -> Sender<T> {
+        self.sender.clone()
+    }
 
-    // Our wasm module we'll be instantiating requires one imported function.
-    // the function takes no parameters and returns no results. We create a host
-    // implementation of that function here, and the `caller` parameter here is
-    // used to get access to our original `MyState` value.
-    println!("Creating callback...");
-    let hello_func = Func::wrap(&mut store, |mut caller: Caller<'_, MyState>| {
-        println!("Calling back...");
-        println!("> {}", caller.data().name);
-        caller.data_mut().count += 1;
+    fn signal_start(&self) {
+        self.start_signal.notify_waiters();
+    }
+
+    fn spawn_processor<F>(&self, handler: F) -> tokio::task::JoinHandle<()>
+    where
+        F: Fn(T) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static,
+    {
+        let mut receiver = self.sender.subscribe();
+        let signal = Arc::clone(&self.start_signal);
+
+        tokio::spawn(async move {
+            signal.notified().await;
+
+            while let Ok(item) = receiver.recv().await {
+                handler(item).await;
+            }
+        })
+    }
+}
+
+#[tokio::main]
+async fn main() {
+
+    let processor: QueueProcessor<u32> = QueueProcessor::new();
+
+    let sender1 = processor.sender();
+    let sender2 = processor.sender();
+
+    let producer1 = tokio::spawn(async move {
+        for i in 0..5 {
+            sender1.send(i).unwrap();
+            println!("Producer 1 sent: {}", i);
+        }
     });
 
-    // Once we've got that all set up we can then move to the instantiation
-    // phase, pairing together a compiled module as well as a set of imports.
-    // Note that this is where the wasm `start` function, if any, would run.
-    println!("Instantiating module...");
-    let imports = [hello_func.into()];
-    let instance = Instance::new(&mut store, &module, &imports)?;
+    let producer2 = tokio::spawn(async move {
+        for i in 100..105 {
+            sender2.send(i).unwrap();
+            println!("Producer 2 sent: {}", i);
+        }
+    });
 
-    // Next we poke around a bit to extract the `run` function from the module.
-    println!("Extracting export...");
-    let run = instance.get_typed_func::<(), ()>(&mut store, "run")?;
+    let consumer1 = processor.spawn_processor(|item| {
+        Box::pin(async move {
+            println!("Consumer 1 processed: {}", item);
+        })
+    });
 
-    // And last but not least we can call it!
-    println!("Calling export...");
-    run.call(&mut store, ())?;
+    let consumer2 = processor.spawn_processor(|item| {
+        Box::pin(async move {
+            println!("Consumer 2 processed: {}", item);
+        })
+    });
 
-    println!("Done.");
-    Ok(())
+    producer1.await.unwrap();
+    producer2.await.unwrap();
+
+    println!("Arbitrary condition met (producers done), starting processing...");
+    processor.signal_start();
+
+    drop(processor);
+
+    consumer1.await.unwrap();
+    consumer2.await.unwrap();
+
+    println!("All done!");
 }
